@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+import fcntl
+import logging
+import os
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from shutil import which
+
+from faster_whisper import WhisperModel
+from pynput import keyboard
+
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local" / "state" / "voice-dictation"
+LOCK_PATH = STATE_DIR / "daemon.lock"
+LOG_PATH = STATE_DIR / "daemon.log"
+
+MODEL_NAME = os.environ.get("VOICE_DICTATION_MODEL", "turbo")
+LANGUAGE = os.environ.get("VOICE_DICTATION_LANGUAGE", "").strip()
+BACKEND = os.environ.get("VOICE_DICTATION_BACKEND", "local").strip().lower()
+OPENAI_MODEL = os.environ.get("VOICE_DICTATION_OPENAI_MODEL", "gpt-4o-transcribe").strip()
+COMPUTE_TYPE = os.environ.get("VOICE_DICTATION_COMPUTE_TYPE", "int8").strip()
+PROMPT = os.environ.get("VOICE_DICTATION_PROMPT", "").strip()
+HOTWORDS = os.environ.get("VOICE_DICTATION_HOTWORDS", "").strip()
+ARECORD_DEVICE = os.environ.get("VOICE_DICTATION_ARECORD_DEVICE", "").strip()
+BEAM_SIZE = int(os.environ.get("VOICE_DICTATION_BEAM_SIZE", "5"))
+USE_VAD = os.environ.get("VOICE_DICTATION_USE_VAD", "0").strip().lower() in {"1", "true", "yes", "on"}
+HOTKEY = keyboard.Key.f8
+DEBOUNCE_SECONDS = 0.35
+
+
+def ensure_state_dir() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        filename=LOG_PATH,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
+def notify(summary: str, body: str = "") -> None:
+    if which("notify-send"):
+        cmd = ["notify-send", summary]
+        if body:
+            cmd.append(body)
+        try:
+            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            logging.exception("failed to send notification")
+    logging.info("%s %s", summary, body)
+
+
+def display_language() -> str:
+    return LANGUAGE or "auto"
+
+
+def acquire_lock():
+    handle = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("voice-dictation-daemon is already running")
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
+class DictationDaemon:
+    def __init__(self) -> None:
+        self.controller = keyboard.Controller()
+        self.model = None
+        self.record_proc = None
+        self.record_path = None
+        self.busy = False
+        self.last_toggle = 0.0
+        self.state_lock = threading.Lock()
+
+    def preload_model(self) -> None:
+        self._ensure_model()
+
+    def _ensure_model(self) -> WhisperModel:
+        if self.model is None:
+            notify("Voice dictation", f"Loading local model: {MODEL_NAME}")
+            logging.info("loading whisper model %s", MODEL_NAME)
+            self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE)
+        return self.model
+
+    def on_release(self, key) -> None:
+        if key != HOTKEY:
+            return
+        now = time.monotonic()
+        if now - self.last_toggle < DEBOUNCE_SECONDS:
+            return
+        self.last_toggle = now
+        self.toggle()
+
+    def toggle(self) -> None:
+        with self.state_lock:
+            if self.busy:
+                notify("Voice dictation", "Still transcribing. Wait a moment.")
+                return
+            if self.record_proc is None:
+                self._start_recording()
+            else:
+                self._stop_recording()
+
+    def _start_recording(self) -> None:
+        if which("arecord") is None:
+            notify("Voice dictation", "Missing arecord. Install alsa-utils.")
+            return
+
+        fd, tmp_path = tempfile.mkstemp(prefix="voice-dictation-", suffix=".wav")
+        os.close(fd)
+        os.unlink(tmp_path)
+
+        cmd = ["arecord", "-q"]
+        if ARECORD_DEVICE:
+            cmd.extend(["-D", ARECORD_DEVICE])
+        cmd.extend(["-f", "S16_LE", "-c", "1", "-r", "16000", tmp_path])
+
+        try:
+            self.record_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+            self.record_path = tmp_path
+            notify("Voice dictation", "Recording. Press F8 again to stop.")
+            logging.info("recording started: %s", tmp_path)
+        except Exception:
+            self.record_proc = None
+            self.record_path = None
+            logging.exception("failed to start arecord")
+            notify("Voice dictation", "Could not access the microphone.")
+
+    def _stop_recording(self) -> None:
+        proc = self.record_proc
+        wav_path = self.record_path
+        self.record_proc = None
+        self.record_path = None
+        self.busy = True
+
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                logging.exception("failed to signal arecord")
+
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    logging.exception("failed to terminate arecord")
+                proc.wait(timeout=3)
+
+        notify("Voice dictation", "Transcribing...")
+        threading.Thread(target=self._transcribe_and_type, args=(wav_path,), daemon=True).start()
+
+    def _transcribe_and_type(self, wav_path: str | None) -> None:
+        try:
+            if not wav_path or not Path(wav_path).exists():
+                notify("Voice dictation", "No recording captured.")
+                return
+
+            text = self._transcribe(wav_path)
+            logging.info("transcribed text: %s", text)
+
+            if not text:
+                notify("Voice dictation", "No speech detected.")
+                return
+
+            time.sleep(0.15)
+            self.controller.type(text)
+            notify("Voice dictation", f"Inserted: {text[:80]}")
+        except Exception:
+            logging.exception("transcription failed")
+            notify("Voice dictation", "Transcription failed. See daemon.log.")
+        finally:
+            if wav_path:
+                try:
+                    Path(wav_path).unlink(missing_ok=True)
+                except Exception:
+                    logging.exception("failed to remove temp wav")
+            with self.state_lock:
+                self.busy = False
+
+    def _transcribe(self, wav_path: str) -> str:
+        if BACKEND == "openai":
+            return self._transcribe_openai(wav_path)
+        return self._transcribe_local(wav_path)
+
+    def _transcribe_local(self, wav_path: str) -> str:
+        model = self._ensure_model()
+        segments, _ = model.transcribe(
+            wav_path,
+            language=LANGUAGE or None,
+            vad_filter=USE_VAD,
+            beam_size=BEAM_SIZE,
+            best_of=max(BEAM_SIZE, 1),
+            condition_on_previous_text=False,
+            initial_prompt=PROMPT or None,
+            hotwords=HOTWORDS or None,
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
+
+    def _transcribe_openai(self, wav_path: str) -> str:
+        if not os.environ.get("OPENAI_API_KEY"):
+            notify("Voice dictation", "OPENAI_API_KEY is not set.")
+            return ""
+
+        try:
+            from openai import OpenAI
+        except Exception:
+            notify("Voice dictation", "OpenAI SDK is not installed in the dictation venv.")
+            return ""
+
+        client = OpenAI()
+        with open(wav_path, "rb") as audio_file:
+            response = client.audio.transcriptions.create(
+                model=OPENAI_MODEL,
+                file=audio_file,
+                response_format="text",
+                language=LANGUAGE or None,
+                prompt=PROMPT or None,
+            )
+        return getattr(response, "text", str(response)).strip()
+
+    def run(self) -> None:
+        notify(
+            "Voice dictation",
+            f"Ready. F8 toggles recording. Backend={BACKEND}, model={MODEL_NAME if BACKEND == 'local' else OPENAI_MODEL}, language={display_language()}",
+        )
+        with keyboard.Listener(on_release=self.on_release) as listener:
+            listener.join()
+
+
+def main() -> None:
+    ensure_state_dir()
+    configure_logging()
+    lock_handle = acquire_lock()
+    daemon = DictationDaemon()
+
+    if len(os.sys.argv) > 1 and os.sys.argv[1] == "--preload":
+        daemon.preload_model()
+        print(f"model ready: {MODEL_NAME}")
+        return
+
+    try:
+        daemon.run()
+    finally:
+        lock_handle.close()
+
+
+if __name__ == "__main__":
+    main()

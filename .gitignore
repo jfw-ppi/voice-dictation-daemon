@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+config/voice-dictation.secret.env
+config/voice-dictation.local.env
+*.log
+

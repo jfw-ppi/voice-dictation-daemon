@@ -1,0 +1,15 @@
+[Unit]
+Description=Global voice dictation daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/voice-dictation.env
+EnvironmentFile=-%h/.config/voice-dictation.secret.env
+ExecStart=%h/.local/bin/voice-dictation-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
