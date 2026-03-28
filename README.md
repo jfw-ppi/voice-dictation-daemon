@@ -12,6 +12,7 @@ Tracked source for the global push-to-talk speech-to-text daemon currently used 
 
 ## Repo Layout
 
+- `install.sh`: install or update helper for the current user
 - `bin/voice-dictation-daemon`: current daemon script
 - `systemd/user/voice-dictation.service`: current user service unit
 - `config/voice-dictation.env.example`: non-secret config template
@@ -37,7 +38,8 @@ The optional remote backend depends on:
 
 The live machine currently uses:
 
-- daemon at `~/.local/bin/voice-dictation-daemon`
+- launcher at `~/.local/bin/voice-dictation-daemon`
+- private app files at `~/.local/share/voice-dictation`
 - config at `~/.config/voice-dictation.env`
 - optional secret config at `~/.config/voice-dictation.secret.env`
 - service unit at `~/.config/systemd/user/voice-dictation.service`
@@ -47,33 +49,30 @@ This repo intentionally tracks the current app state without committing secrets.
 
 ## Install Or Update From Repo
 
-1. Create or activate a Python environment and install dependencies:
+Run:
 
 ```bash
-python3 -m venv ~/.local/share/voice-dictation/venv
-~/.local/share/voice-dictation/venv/bin/pip install -U pip
-~/.local/share/voice-dictation/venv/bin/pip install -r requirements.txt
+./install.sh
 ```
 
-2. Install the daemon and service:
+The installer:
 
-```bash
-install -Dm755 bin/voice-dictation-daemon ~/.local/bin/voice-dictation-daemon
-install -Dm644 systemd/user/voice-dictation.service ~/.config/systemd/user/voice-dictation.service
-install -Dm600 config/voice-dictation.env.example ~/.config/voice-dictation.env
-```
+- creates or updates `~/.local/share/voice-dictation/venv`
+- installs the daemon payload under `~/.local/share/voice-dictation/libexec`
+- installs a launcher at `~/.local/bin/voice-dictation-daemon` that uses that venv
+- installs `systemd/user/voice-dictation.service` to `~/.config/systemd/user/`
+- creates `~/.config/voice-dictation.env` only if it does not already exist
+- reloads, enables, and restarts `voice-dictation.service` when `systemctl --user` is available
 
-3. Reload and restart the user service:
+Useful flags:
 
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now voice-dictation.service
-systemctl --user restart voice-dictation.service
-```
+- `./install.sh --no-systemd` to skip service reload/start
+- `./install.sh --force-config` to overwrite `~/.config/voice-dictation.env`
+- `./install.sh --skip-pip` to skip Python package installation
 
 ## Configuration
 
-Copy `config/voice-dictation.env.example` to `~/.config/voice-dictation.env` and adjust:
+Adjust `~/.config/voice-dictation.env` after install:
 
 - `VOICE_DICTATION_BACKEND=local` for local `faster-whisper`
 - `VOICE_DICTATION_BACKEND=openai` for OpenAI transcription
